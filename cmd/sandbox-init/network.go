@@ -63,7 +63,117 @@ func applyNetwork(spec *proto.NetworkSpec) error { return applyNetworkMode(spec,
 // addresses first and uses REPLACE semantics for the new address + default
 // route — letting a clone restored from a golden snapshot take a fresh
 // network identity without inheriting the snapshot's IP.
-func applyNetworkReplace(spec *proto.NetworkSpec) error { return applyNetworkMode(spec, true) }
+//
+// The common restore (same node or cross-node with an unchanged guest
+// identity) carries exactly the values the snapshot already applied; rewriting
+// them costs 7-15ms of netlink traffic for no effect. Skip when every field
+// already matches.
+func applyNetworkReplace(spec *proto.NetworkSpec) error {
+	if ok, err := networkAlreadyApplied(spec); err == nil && ok {
+		logf("restore network: already applied; skipping re-apply")
+		return nil
+	}
+	return applyNetworkMode(spec, true)
+}
+
+// networkAlreadyApplied reports whether the guest IP layer already matches the
+// requested spec. Any unverifiable or missing field returns false so the caller
+// performs the full replace.
+func networkAlreadyApplied(spec *proto.NetworkSpec) (bool, error) {
+	if spec == nil {
+		return true, nil
+	}
+	if spec.Hostname != "" {
+		current, err := os.Hostname()
+		if err != nil || current != spec.Hostname {
+			return false, err
+		}
+	}
+	if spec.IPCIDR == "" {
+		return true, nil
+	}
+	iface := spec.Interface
+	if iface == "" {
+		iface = "eth0"
+	}
+	dev, err := net.InterfaceByName(iface)
+	if err != nil {
+		return false, err
+	}
+	if spec.MTU != 0 && dev.MTU != spec.MTU {
+		return false, nil
+	}
+	ip, ipnet, err := net.ParseCIDR(spec.IPCIDR)
+	if err != nil {
+		return false, err
+	}
+	if ip.To4() == nil {
+		// IPv6 default routes are not inspected here; take the full path.
+		return false, nil
+	}
+	wantOnes, wantBits := ipnet.Mask.Size()
+	addrs, err := dev.Addrs()
+	if err != nil {
+		return false, err
+	}
+	addrMatch := false
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || !ipnet.IP.Equal(ip) {
+			continue
+		}
+		ones, bits := ipnet.Mask.Size()
+		if ones == wantOnes && bits == wantBits {
+			addrMatch = true
+			break
+		}
+	}
+	if !addrMatch {
+		return false, nil
+	}
+	if spec.Nexthop != "" {
+		match, err := defaultRouteMatches(spec.Nexthop)
+		if err != nil || !match {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// defaultRouteMatches reports whether the IPv4 default route already uses
+// nexthop. /proc/net/route stores Destination/Mask/Gateway as little-endian
+// hex.
+func defaultRouteMatches(nexthop string) (bool, error) {
+	raw, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return false, err
+	}
+	want := net.ParseIP(nexthop).To4()
+	if want == nil {
+		return false, nil
+	}
+	for i, line := range strings.Split(string(raw), "\n") {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 8 {
+			continue
+		}
+		// Iface Destination Gateway Flags RefCnt Use Metric Mask MTU ...
+		if fields[1] != "00000000" || fields[7] != "00000000" {
+			continue // not a default route
+		}
+		gw, err := strconv.ParseUint(fields[2], 16, 32)
+		if err != nil {
+			continue
+		}
+		var got [4]byte
+		binary.LittleEndian.PutUint32(got[:], uint32(gw))
+		return net.IP(got[:]).Equal(want), nil
+	}
+	return false, nil
+}
 
 // applyNetworkMode executes hostname + bring-iface-up(+MTU) + assign-IP +
 // default-route in order. When replace is true it flushes existing global
